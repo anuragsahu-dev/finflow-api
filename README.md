@@ -1,6 +1,8 @@
 # FinFlow – Financial Management Backend API
 
-A production-ready RESTful API for personal budget and expense tracking built with Node.js, Express, TypeScript, and PostgreSQL.
+FinFlow is a financial management backend API built with Node.js and TypeScript.
+
+It includes authentication, payment processing, budgeting features, background jobs, and containerized deployment using Docker Swarm.
 
 ---
 
@@ -33,6 +35,66 @@ A production-ready RESTful API for personal budget and expense tracking built wi
 - **File Storage** - AWS S3 for avatar uploads with pre-signed URLs
 - **Docker Swarm** - Production deployment with health checks
 - **CI/CD** - GitHub Actions for testing, building, and deployment
+
+---
+
+### Architecture Overview
+
+#### Production Infrastructure – AWS + Docker Swarm (3 Manager Nodes)
+
+```
+Client / Browser
+       │
+       ▼
+   Internet (HTTPS)
+       │
+       ▼
+┌──────────────────────── AWS Cloud (eu-north-1) ───────────────────────┐
+│                                                                       │
+│  ┌────────────── Docker Swarm Cluster (3 Manager Nodes) ────────────┐ │
+│  │                                                                  │ │
+│  │   Node Public Port :80 / :443                                    │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │      Swarm Routing Mesh                                          │ │
+│  │   (any node can accept traffic)                                  │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │      Caddy Service (replicas:1)                                  │ │
+│  │      Reverse Proxy + Auto TLS                                    │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │      Swarm Service VIP (app:3000)                                │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │   FinFlow App Service (replicas:N)                               │ │
+│  │                                                                  │ │
+│  │   Manager Node 1 (Leader) → Replica(s)                           │ │
+│  │   Manager Node 2          → Replica(s)                           │ │
+│  │   Manager Node 3          → Replica(s)                           │ │
+│  │                                                                  │ │
+│  │   Overlay Network: finflow_net                                   │ │
+│  │   Docker Secrets (encrypted)                                     │ │
+│  │                                                                  │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+                     │
+        ┌────────────┼────────────┬──────────────┐
+        ▼            ▼            ▼              ▼
+  Neon PostgreSQL  Upstash Redis  AWS S3      Razorpay
+   (Prisma ORM)     (BullMQ)     File Storage Payments
+                      │
+                      ▼
+                  SMTP/Gmail
+                   (Email)
+```
+
+> Requests terminate at the Caddy reverse proxy, which forwards traffic to the Docker Swarm
+> service. Docker Swarm distributes traffic across application replicas using its internal
+> routing mesh and VIP load balancing.
+
+> For detailed architecture documentation, see [Architecture](docs/ARCHITECTURE.md)
 
 ---
 
