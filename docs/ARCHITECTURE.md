@@ -20,6 +20,182 @@ This document provides an overview of the FinFlow API's architecture, design dec
 
 ## High-Level Architecture
 
+### Production Infrastructure – AWS + Docker Swarm (3 Manager Nodes)
+
+```
+Client / Browser
+       │
+       ▼
+   Internet (HTTPS)
+       │
+       ▼
+┌──────────────────────── AWS Cloud (eu-north-1) ───────────────────────┐
+│                                                                       │
+│  ┌────────────── Docker Swarm Cluster (3 Manager Nodes) ────────────┐ │
+│  │                                                                  │ │
+│  │   Node Public Port :80 / :443                                    │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │      Swarm Routing Mesh                                          │ │
+│  │   (any node can accept traffic)                                  │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │      Caddy Service (replicas:1)                                  │ │
+│  │      Reverse Proxy + Auto TLS                                    │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │      Swarm Service VIP (app:3000)                                │ │
+│  │            │                                                     │ │
+│  │            ▼                                                     │ │
+│  │   FinFlow App Service (replicas:N)                               │ │
+│  │                                                                  │ │
+│  │   Manager Node 1 (Leader) → Replica(s)                           │ │
+│  │   Manager Node 2          → Replica(s)                           │ │
+│  │   Manager Node 3          → Replica(s)                           │ │
+│  │                                                                  │ │
+│  │   Overlay Network: finflow_net                                   │ │
+│  │   Docker Secrets (encrypted)                                     │ │
+│  │                                                                  │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+                     │
+        ┌────────────┼────────────┬──────────────┐
+        ▼            ▼            ▼              ▼
+  Neon PostgreSQL  Upstash Redis  AWS S3      Razorpay
+   (Prisma ORM)     (BullMQ)     File Storage Payments
+                      │
+                      ▼
+                  SMTP/Gmail
+                   (Email)
+```
+
+> **How it works:** Caddy runs as a single replica. The app service can be scaled to N replicas
+> (e.g. `docker service scale finflow-api_app=10`). Swarm distributes containers across the
+> 3 manager nodes and Caddy's `reverse_proxy app:3000` automatically load balances via
+> Swarm's **VIP (Virtual IP)**. The routing mesh ensures any node can accept incoming traffic
+> on ports 80/443 even if Caddy isn't running on that specific node.
+
+### Application Architecture – Internal Request Flow
+
+```
+  Client Request (HTTPS)
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                   Caddy (Reverse Proxy)                         │
+  │              TLS Termination (Let's Encrypt)                    │
+  │              :443 → reverse_proxy app:3000                      │
+  └──────────────────────────┬───────────────────────────────────────┘
+                             │ HTTP :3000
+                             ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                   Express 5 Application                         │
+  │                                                                 │
+  │  ┌────────────────────────────────────────────────────────────┐ │
+  │  │                  Middleware Pipeline                        │ │
+  │  │                                                            │ │
+  │  │  Helmet → CORS → Cookie Parser → Rate Limiter (Redis)     │ │
+  │  │       → JSON Parser → Request Logger                      │ │
+  │  └────────────────────────┬───────────────────────────────────┘ │
+  │                           │                                     │
+  │  ┌────────────────────────▼───────────────────────────────────┐ │
+  │  │                   API Router (/api/v1)                     │ │
+  │  │                                                            │ │
+  │  │  /auth    /users    /categories    /transactions           │ │
+  │  │  /budgets /analytics /payments     /subscriptions          │ │
+  │  │  /admin   /health                                          │ │
+  │  └────────────────────────┬───────────────────────────────────┘ │
+  │                           │                                     │
+  │  ┌────────────────────────▼───────────────────────────────────┐ │
+  │  │               Route-Level Middleware                       │ │
+  │  │                                                            │ │
+  │  │  Auth Middleware (JWT) → Zod Validation → Controller       │ │
+  │  └────────────────────────┬───────────────────────────────────┘ │
+  │                           │                                     │
+  │  ┌────────────────────────▼───────────────────────────────────┐ │
+  │  │              Controller → Service → Repository             │ │
+  │  │                                                            │ │
+  │  │  Controller: Extract req data, call service, send response │ │
+  │  │  Service:    Business logic, orchestration, error handling │ │
+  │  │  Repository: Prisma queries, DB error handling             │ │
+  │  └────────────────────────┬───────────────────────────────────┘ │
+  │                           │                                     │
+  │  ┌────────────────────────▼───────────────────────────────────┐ │
+  │  │                 Global Error Handler                       │ │
+  │  │            ApiError → Standardized JSON Response           │ │
+  │  └────────────────────────────────────────────────────────────┘ │
+  └──────────────────────────────────────────────────────────────────┘
+         │                    │                     │
+         ▼                    ▼                     ▼
+  ┌─────────────┐    ┌──────────────┐      ┌──────────────┐
+  │  PostgreSQL  │    │    Redis     │      │   BullMQ     │
+  │  (Prisma)    │    │  (Rate Limit │      │  (Email,     │
+  │  (Neon)      │    │   Sessions)  │      │  Scheduler)  │
+  └─────────────┘    └──────────────┘      └──────────────┘
+```
+
+### CI/CD Pipeline – GitHub Actions to Production
+
+```
+  Developer Workstation
+         │
+         │  git push / PR
+         ▼
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                       GitHub Repository                         │
+  │                                                                 │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  PR to main → ci.yaml                                    │   │
+  │  │  ┌──────────┐ ┌────────────┐ ┌───────────────┐ ┌──────┐ │   │
+  │  │  │   Lint   │ │ Unit Tests │ │ Integration   │ │Build │ │   │
+  │  │  │ (3 Node  │ │ (Vitest)   │ │ Tests         │ │Check │ │   │
+  │  │  │ versions)│ │            │ │ (PG + Redis)  │ │      │ │   │
+  │  │  └──────────┘ └────────────┘ └───────────────┘ └──────┘ │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                           │ merge to main                       │
+  │                           ▼                                     │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  Push to main → migrate.yaml                              │   │
+  │  │  ┌────────────────────┐  ┌─────────────────────────────┐ │   │
+  │  │  │ Migrate Production │  │ Sync Ephemeral DB (Neon #2) │ │   │
+  │  │  │ DB (Neon #1)       │  │ (continue-on-error)         │ │   │
+  │  │  └────────────────────┘  └─────────────────────────────┘ │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                           │ manual trigger                      │
+  │                           ▼                                     │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  Manual → build.yaml                                      │   │
+  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐ │   │
+  │  │  │ Build Docker │  │ Tag image    │  │ Push to        │ │   │
+  │  │  │ image (amd64)│  │ build-<SHA>  │  │ Docker Hub     │ │   │
+  │  │  └──────────────┘  │ + latest     │  │                │ │   │
+  │  │                    └──────────────┘  └────────────────┘ │   │
+  │  │  Auto-updates compose.yaml with new image tag            │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                           │ manual trigger                      │
+  │                           ▼                                     │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │  Manual → deploy.yaml                                     │   │
+  │  │  ┌─────────────┐  ┌───────────────┐  ┌────────────────┐ │   │
+  │  │  │ SSH to EC2   │  │ docker stack  │  │ Health check   │ │   │
+  │  │  │ Pull image   │  │ deploy        │  │ verification   │ │   │
+  │  │  │              │  │ (rolling      │  │ (120s timeout) │ │   │
+  │  │  │              │  │  update)      │  │                │ │   │
+  │  │  └─────────────┘  └───────────────┘  └────────────────┘ │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                   ┌─────────────────────┐
+                   │  Docker Swarm       │
+                   │  (3 EC2 Managers)   │
+                   │  Rolling Update     │
+                   │  start-first        │
+                   │  auto-rollback      │
+                   └─────────────────────┘
+```
+
 ### Production Stack
 
 | Component         | Technology             | Purpose                               |
@@ -34,12 +210,14 @@ This document provides an overview of the FinFlow API's architecture, design dec
 
 ### Request Flow
 
-1. Client sends HTTPS request to EC2 server
-2. Caddy terminates SSL and proxies to Node.js app on port 3000
-3. Express handles routing, authentication, validation
-4. Service layer processes business logic
-5. Repository layer interacts with PostgreSQL via Prisma
-6. Response sent back through the same chain
+1. Client sends HTTPS request to any Swarm node's public IP
+2. Swarm routing mesh forwards traffic to the Caddy service
+3. Caddy terminates TLS and proxies to the app via Swarm VIP (`app:3000`)
+4. Swarm VIP load balances across available app replicas
+5. Express handles routing, authentication, and validation
+6. Service layer processes business logic
+7. Repository layer interacts with PostgreSQL via Prisma
+8. Response sent back through the same chain
 
 ---
 
@@ -292,8 +470,12 @@ See [PAYMENT_SYSTEM.md](PAYMENT_SYSTEM.md) for detailed documentation.
 
 ### Current Design
 
-- Docker Swarm single-node deployment
-- Suitable for MVP, small to medium user base
+- Docker Swarm cluster with **3 Manager Nodes** on AWS EC2 (eu-north-1)
+- Caddy runs as a single Docker Swarm service replica exposed through the Swarm routing mesh
+- Docker Swarm schedules replicas across available nodes based on cluster state
+- Overlay network (`finflow_net`) for inter-service communication
+- Docker Secrets for production credentials
+- Suitable for small to medium user base with high availability
 
 ### Future Scaling Path
 
